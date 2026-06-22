@@ -1,0 +1,23 @@
+# =====================================================================
+# Triaje Forense Automatizado - Dependencias
+# =====================================================================
+
+# --- Interfaz y datos ---
+streamlit
+pandas
+Pillow
+
+# --- Acceso a imágenes forenses ---
+libewf-python      # Proporciona el módulo `pyewf` (E01/EX01/L01)
+pytsk3             # The Sleuth Kit bindings (dd/raw/img + particiones + FS)
+
+# --- Parsing de artefactos de Windows ---
+python-registry    # Proporciona el módulo `Registry` (hives SOFTWARE/SYSTEM/SAM/NTUSER.DAT)
+python-evtx        # Proporciona el módulo `Evtx` (Windows Event Log)
+
+# --- Generación de informes ---
+reportlab          # Informe pericial en PDF (UNE 197010:2015)
+python-docx        # Informe pericial en Word (UNE 197010:2015)
+
+# --- Empaquetado (solo necesario para generar el .exe portable) ---
+pyinstaller
