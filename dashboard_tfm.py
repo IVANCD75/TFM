@@ -161,7 +161,7 @@ if st.session_state["analisis_pendiente"]:
             # La capa de extracción comunica los fallos por excepción; aquí, en
             # la capa de presentación, decidimos cómo mostrarlos al usuario.
             nuevos_resultados = None
-            status.write(f"❌ {e}")
+            status.write(f"{e}")
         tiempo_total = time.time() - total_start
 
         if nuevos_resultados:
