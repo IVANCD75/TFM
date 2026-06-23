@@ -189,12 +189,26 @@ class _NullLogger:
     def end(self, nombre, duracion): pass
 
 
-def _run_step(logger, nombre, fn):
-    """Helper que envuelve un paso reportando inicio y fin."""
+def _run_step(logger, nombre, fn, label_fn=None):
+    """Ejecuta un paso del análisis instrumentándolo en AMBOS loggers.
+
+    - `logger` (UIStatusLogger): progreso en vivo + expander de la interfaz.
+    - `log` (logging de Python → triaje_forense.log): traza persistente, que es
+      el registro de auditoría real de la herramienta. Antes solo se escribía en
+      él ante errores, por lo que un análisis correcto no dejaba ninguna huella.
+
+    `label_fn`, si se indica, recibe el resultado del paso y construye la etiqueta
+    de fin, permitiendo incluir contadores dinámicos (p. ej. "USB (5 dispositivos)")
+    sin perder el reporte previo a conocer ese resultado.
+    """
     logger.start(nombre)
+    log.info("▶ Inicio: %s", nombre)
     t = time.time()
     result = fn()
-    logger.end(nombre, time.time() - t)
+    dur = time.time() - t
+    fin_label = label_fn(result) if label_fn else nombre
+    logger.end(fin_label, dur)
+    log.info("✔ Fin: %s (%.2fs)", fin_label, dur)
     return result
 
 
@@ -212,133 +226,127 @@ def procesar_evidencia(ruta_imagen, logger=None):
                      `end(nombre, duracion)` para reportar progreso.
     """
     logger = logger or _NullLogger()
+    log.info("===== Inicio del análisis de evidencia: %s =====", ruta_imagen)
     data = {"ruta_imagen": ruta_imagen}
 
-    # --- 1. APERTURA DE IMAGEN ---
-    logger.start("Apertura de imagen")
-    t = time.time()
-    try:
-        img_info = _abrir_imagen(ruta_imagen)
-    except Exception as e:
-        log.error("Error al abrir la imagen '%s': %s", ruta_imagen, e)
-        raise EvidenciaError(f"Error al abrir la imagen: {e}") from e
-    logger.end("Apertura de imagen", time.time() - t)
+    # -------- 1. APERTURA DE IMAGEN --------
+    def _abrir():
+        try:
+            return _abrir_imagen(ruta_imagen)
+        except Exception as e:
+            log.error("Error al abrir la imagen '%s': %s", ruta_imagen, e)
+            raise EvidenciaError(f"Error al abrir la imagen: {e}") from e
 
-    # --- 2. PARTICIONES ---
-    logger.start("Detección de particiones")
-    t = time.time()
-    data["particiones"] = extraer_particiones(img_info)
-    logger.end(f"Detección de particiones ({len(data['particiones'])})", time.time() - t)
+    img_info = _run_step(logger, "Apertura de imagen", _abrir)
 
-    # --- 3. PARTICIÓN DE WINDOWS ---
-    logger.start("Localización del sistema de archivos Windows")
-    t = time.time()
-    fs = _encontrar_fs_windows(img_info)
+    # -------- 2. PARTICIONES --------
+    data["particiones"] = _run_step(
+        logger, "Detección de particiones",
+        lambda: extraer_particiones(img_info),
+        label_fn=lambda r: f"Detección de particiones ({len(r)})",
+    )
+
+    # -------- 3. PARTICIÓN DE WINDOWS --------
+    fs = _run_step(
+        logger, "Localización del sistema de archivos Windows",
+        lambda: _encontrar_fs_windows(img_info),
+    )
     if not fs:
         log.error("No se encontró partición de Windows válida en '%s'", ruta_imagen)
         raise EvidenciaError("No se encontró partición de Windows válida.")
-    logger.end("Localización del sistema de archivos Windows", time.time() - t)
 
-    # --- 4. HIVES PRINCIPALES ---
-    logger.start("Hive SOFTWARE")
-    t = time.time()
-    reg_software = _extraer_software_hive(fs, data)
-    logger.end("Hive SOFTWARE", time.time() - t)
+    # -------- 4. HIVES PRINCIPALES --------
+    reg_software = _run_step(
+        logger, "Hive SOFTWARE", lambda: _extraer_software_hive(fs, data)
+    )
+    reg_system = _run_step(
+        logger, "Hive SYSTEM", lambda: _extraer_system_hive(fs, data)
+    )
+    _run_step(logger, "Hive SAM (usuarios)", lambda: _extraer_sam_hive(fs, data))
 
-    logger.start("Hive SYSTEM")
-    t = time.time()
-    reg_system = _extraer_system_hive(fs, data)
-    logger.end("Hive SYSTEM", time.time() - t)
-
-    logger.start("Hive SAM (usuarios)")
-    t = time.time()
-    _extraer_sam_hive(fs, data)
-    logger.end("Hive SAM (usuarios)", time.time() - t)
-
-    # --- 5. HIVES DE USUARIO ---
-    logger.start("Hives de usuario")
-    t = time.time()
-    user_hives = _cargar_user_hives(fs)
-    logger.end(f"Hives de usuario ({len(user_hives)} cargadas)", time.time() - t)
-
-    # --- 6. APPS INSTALADAS + ANTI-FORENSE ---
-    logger.start("Aplicaciones instaladas y anti-forenses")
-    t = time.time()
-    data["apps"] = extraer_apps_instaladas(reg_software, user_hives)
-    logger.end(
-        f"Apps instaladas ({len(data['apps']['instaladas'])} totales, "
-        f"{len(data['apps']['anti_forensic'])} anti-forenses)",
-        time.time() - t,
+    # -------- 5. HIVES DE USUARIO --------
+    user_hives = _run_step(
+        logger, "Hives de usuario",
+        lambda: _cargar_user_hives(fs),
+        label_fn=lambda r: f"Hives de usuario ({len(r)} cargadas)",
     )
 
-    # --- 7. USB ---
-    logger.start("Historial de dispositivos USB")
-    t = time.time()
-    data["usb"] = extraer_usb(fs, reg_system, reg_software)
-    logger.end(f"Historial USB ({len(data['usb'])} dispositivos)", time.time() - t)
-
-    # --- 8. ACTIVIDAD DE EJECUCIÓN ---
-    logger.start("Actividad de ejecución (Prefetch/UserAssist/Amcache)")
-    t = time.time()
-    data["actividad"] = extraer_actividad(fs, user_hives)
-    logger.end(
-        f"Actividad (Prefetch={len(data['actividad']['prefetch'])}, "
-        f"UserAssist={len(data['actividad']['userassist'])}, "
-        f"Amcache={len(data['actividad']['amcache'])})",
-        time.time() - t,
+    # -------- 6. APPS INSTALADAS + ANTI-FORENSE --------
+    data["apps"] = _run_step(
+        logger, "Aplicaciones instaladas y anti-forenses",
+        lambda: extraer_apps_instaladas(reg_software, user_hives),
+        label_fn=lambda r: (
+            f"Apps instaladas ({len(r['instaladas'])} totales, "
+            f"{len(r['anti_forensic'])} anti-forenses)"
+        ),
     )
 
-    # --- 9. PERSISTENCIA ---
-    logger.start("Análisis de persistencia (Run keys / Tareas)")
-    t = time.time()
-    data["persistencia"] = extraer_persistencia(fs, reg_software, user_hives)
-    logger.end(
-        f"Persistencia (Run={len(data['persistencia']['run_keys'])}, "
-        f"Tareas={len(data['persistencia']['scheduled_tasks'])})",
-        time.time() - t,
+    # -------- 7. USB --------
+    data["usb"] = _run_step(
+        logger, "Historial de dispositivos USB",
+        lambda: extraer_usb(fs, reg_system, reg_software),
+        label_fn=lambda r: f"Historial USB ({len(r)} dispositivos)",
     )
 
-    # --- 10. RED ---
-    logger.start("Actividad de red (perfiles e interfaces)")
-    t = time.time()
-    data["red"] = extraer_red(reg_system, reg_software)
-    logger.end(
-        f"Red ({len(data['red']['profiles'])} perfiles, "
-        f"{len(data['red']['interfaces'])} interfaces)",
-        time.time() - t,
+    # -------- 8. ACTIVIDAD DE EJECUCIÓN --------
+    data["actividad"] = _run_step(
+        logger, "Actividad de ejecución (Prefetch/UserAssist/Amcache)",
+        lambda: extraer_actividad(fs, user_hives),
+        label_fn=lambda r: (
+            f"Actividad (Prefetch={len(r['prefetch'])}, "
+            f"UserAssist={len(r['userassist'])}, Amcache={len(r['amcache'])})"
+        ),
     )
 
-    # --- 11. ACTIVIDAD USUARIO ---
-    logger.start("Actividad de usuario (papelera, recientes, drives)")
-    t = time.time()
-    data["actividad_usuario"] = extraer_actividad_usuario(fs, user_hives)
-    mapped = len(data['actividad_usuario']['network_mru']['mapped'])
-    logger.end(
-        f"Actividad usuario (Papelera={data['actividad_usuario']['recycle_bin']['total_count']}, "
-        f"Drives red={mapped})",
-        time.time() - t,
+    # -------- 9. PERSISTENCIA --------
+    data["persistencia"] = _run_step(
+        logger, "Análisis de persistencia (Run keys / Tareas)",
+        lambda: extraer_persistencia(fs, reg_software, user_hives),
+        label_fn=lambda r: (
+            f"Persistencia (Run={len(r['run_keys'])}, "
+            f"Tareas={len(r['scheduled_tasks'])})"
+        ),
     )
 
-    # --- 12. NAVEGACIÓN ---
-    logger.start("Historial de navegación web")
-    t = time.time()
-    data["navegacion"] = extraer_navegacion(fs)
-    logger.end(
-        f"Navegación ({len(data['navegacion']['urls'])} URLs, "
-        f"{len(data['navegacion']['keywords'])} keywords, "
-        f"{len(data['navegacion']['downloads'])} descargas)",
-        time.time() - t,
+    # -------- 10. RED --------
+    data["red"] = _run_step(
+        logger, "Actividad de red (perfiles e interfaces)",
+        lambda: extraer_red(reg_system, reg_software),
+        label_fn=lambda r: (
+            f"Red ({len(r['profiles'])} perfiles, {len(r['interfaces'])} interfaces)"
+        ),
     )
 
-    # --- 13. SEGURIDAD ---
-    logger.start("Estado de seguridad y eventos críticos")
-    t = time.time()
-    data["seguridad"] = extraer_seguridad(fs, reg_system, reg_software)
-    ev = data["seguridad"]["eventos"]
-    logger.end(
-        f"Seguridad (Logons OK={len(ev['logon_success'])}, "
-        f"Fallos={len(ev['logon_failed'])}, Auditoría borrada={len(ev['audit_cleared'])})",
-        time.time() - t,
+    # -------- 11. ACTIVIDAD USUARIO --------
+    data["actividad_usuario"] = _run_step(
+        logger, "Actividad de usuario (papelera, recientes, drives)",
+        lambda: extraer_actividad_usuario(fs, user_hives),
+        label_fn=lambda r: (
+            f"Actividad usuario (Papelera={r['recycle_bin']['total_count']}, "
+            f"Drives red={len(r['network_mru']['mapped'])})"
+        ),
     )
 
+    # -------- 12. NAVEGACIÓN --------
+    data["navegacion"] = _run_step(
+        logger, "Historial de navegación web",
+        lambda: extraer_navegacion(fs),
+        label_fn=lambda r: (
+            f"Navegación ({len(r['urls'])} URLs, {len(r['keywords'])} keywords, "
+            f"{len(r['downloads'])} descargas)"
+        ),
+    )
+
+    # -------- 13. SEGURIDAD --------
+    data["seguridad"] = _run_step(
+        logger, "Estado de seguridad y eventos críticos",
+        lambda: extraer_seguridad(fs, reg_system, reg_software),
+        label_fn=lambda r: (
+            f"Seguridad (Logons OK={len(r['eventos']['logon_success'])}, "
+            f"Fallos={len(r['eventos']['logon_failed'])}, "
+            f"Auditoría borrada={len(r['eventos']['audit_cleared'])})"
+        ),
+    )
+
+    log.info("===== Análisis completado: %s =====", ruta_imagen)
     return data
