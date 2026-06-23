@@ -67,7 +67,15 @@ Si la instalación de `libewf-python` falla, verifica que tienes las **Microsoft
 
 ## Uso
 
-### Modo desarrollo (Usando run.py)
+### Modo desarrollo (Streamlit directo)
+
+```bash
+streamlit run dashboard_tfm.py
+```
+
+Se abrirá automáticamente en el navegador en `http://localhost:8501`.
+
+### Modo usuario final sin empaquetar (Usando run.py)
 
 ```bash
 python run.py
